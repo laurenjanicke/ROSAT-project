@@ -1,0 +1,784 @@
+---
+title: "Classification of Point-Like X-ray Sources in the ROSAT 2RXS Survey"
+output: html_document
+---
+
+Name: Lauren Janicke
+
+Fall 2020
+
+
+## Introduction
+
+There are many telescopes that have collected data at different wavelengths on the electromagnetic spectrum for distant astronomical bodies. One of these was the *ROSAT* telescope, which observed X-rays emitted by astronomical objects. X-rays are emitted from energetic environments, like the areas around supermassive black holes at the centers of galaxies. Many detected X-ray sources are point-like, and it is difficult to classify them without collecting more data at other wavelengths and visually inspecting them. Here, we will attempt to learn a classifier given ROSAT data and data from three other telescopes: *Gaia*, *Sloan Digital Sky Survey*, and *Wide-field Infrared Survey Explorer*. 
+
+<!-- \n After telescopes have gathered data on far away astronomical bodies, someone must determine what they are. Currently, astronomers use more data to classify the astronomical bodies, so using less predictors variables would be more convenient.Here is where statistical modeling comes in. -->
+
+\n ***In this project, I will attempt to classify  objects observed by ROSAT as either quasars, galaxies whose light is dominated by emission from around supermassive black holes, or normal galaxies**
+
+## Data
+
+The data include 4198 astronomical bodies and 26 predictor variables. These variables are generally brightness measurements made at a number of different wavelengths. The predictor variables are further described in the table.
+
+```{r echo=FALSE}
+library(knitr)
+load(file = 'rosat_classify.Rdata')
+varies = c('RXS_ExiML', 'RXS_CRate', 'RXS_Ext', 'RXS_LOGGALNH', 'RXS_SRC_FLUX', 'ALLW_(W1, W2, W3, W4, J, H, K)mag', 'SSDS_MODELMAG_(u, g, r, i, z)', 'SDSS_FIBER2MA_(u, g, r, i, z)', 'Z_BEST', 'GAIA_DR2_phot_(g, bp, rp)_mean_mag')
+description = c('Detection likelihood', 'Source X-ray count rate', 'Source extent in pixels', 'Hydrogen column density', 'Source flux', 'Source magnitudes, in 7 infrared bands', 'Source magnitudes, in 5 optical and near infrared bands', 'Different source magnitudes, in 5 optical and near infrared bands', 'Source redshift -- a measure of source distance', 'Source magnitudes, in 3 optical bands')
+kable(data.frame(Variable=varies, Description=description))
+```
+
+\n There are five current classifications of astronomical bodies in the data. Firstly, quasars (`QSO`) are bodies that emit radiation due to matter falling into a supermassive black hole. Then, broad-line (`BLAGN`) and narrow-line (`NLAGN`) active galactic nuclei are galaxies that are fainter than quasars but are still active at their centers. Another class is galaxy (`GALAXY`). Finally, a star (`STAR`) is a class, but we are noot interested in them; therefore, these data will not be included in the analysis. There are 3955 astronomical bodies to classify now. More classification methods are available when one is only classifying between 2 classes. Thus, `BLAGN` will be considered `QSO`, and `NLAGN` will be considered `GALAXY`. Thus, the response variable contains 2014 `QSO` and 385 `GALAXY`. It is important to note that these classes are imbalanced, and this fact will influence our analysis. In an effort to address this issue, we will use Youden's J statistic to determine the optimal class-separation boundary.
+
+## EDA
+
+```{r}
+suppressMessages(library(plyr))
+suppressMessages(library(tidyverse))
+suppressMessages(library(GGally))
+suppressMessages(library(purrr))
+suppressMessages(library(MASS))
+suppressMessages(library(caret))
+suppressMessages(library(pROC))
+suppressMessages(library(ff))
+suppressMessages(library(glmnet))
+
+predictors.plt = dplyr::select(predictors, RXS_ExiML, RXS_SRC_FLUX, RXS_LOGGALNH, RXS_CRate, ALLW_Hmag, ALLW_W2mag, ALLW_W3mag, ALLW_W4mag, SDSS_MODELMAG_g, SDSS_FIBER2MAG_r, GAIA_DR2_phot_bp_mean_mag, Z_BEST)
+
+ggplot(data=gather(predictors.plt), mapping=aes(x=value)) + geom_histogram(fill='midnightblue') + facet_wrap(~key, scales='free') 
+
+resp.char = trimws(as.character(response))
+ind.star=which(resp.char=="STAR")
+pred = predictors %>% dplyr::slice(-ind.star)
+pred.plot = predictors.plt %>% dplyr::slice(-ind.star)
+resp.char = resp.char[-ind.star]
+resp = factor(resp.char)
+resp = sortLevels(revalue(resp, c("NLAGN"="GALAXY", "BLAGN"="QSO")))
+```
+
+Some variables were excluded because they have very similar distributions to the ones plotted. 
+`ALLW_Hmag` is skewed left, unimodal, and contains outliers.
+`ALLLW_W2mag`, `GAIA_DR2_phot_bp_mean_mag`, `SDSS_FIBER2MAG_r`, and `SDSS_MODELMAG_g` appear symmetrical and unimodal with outliers.
+`ALLW_W3mag` is not symmetrical, unimodal, and has some outliers.
+`ALLW_W4mag` is skewed left, unimodal, has outliers at the lower end, and has a wider distribution than other variables.
+`RXS_LOGGALNH` is not symmetrical, bimodal, and does not appear to have any outliers.
+It appears that `RXS_CRate`, `RXS_ExiML`, `RXS_SRC_FLUX`  and `Z_BEST` are heavily influended by outliers, so these variables will be log-transformed. The following analyses will consider the original and log-transformed data separately. 
+
+```{r}
+ggplot(predictors.plt, mapping = aes(x=log10(RXS_CRate))) + geom_histogram(fill='midnightblue') 
+ggplot(predictors.plt, mapping = aes(x=log10(RXS_ExiML))) + geom_histogram(fill='midnightblue')
+ggplot(predictors.plt, mapping = aes(x=log10(RXS_SRC_FLUX))) + geom_histogram(fill='midnightblue')
+ggplot(predictors.plt, mapping = aes(x=log10(Z_BEST))) + geom_histogram(fill='midnightblue') 
+```
+
+`RXS_CRate` is unimodal, skewed right, and contains outliers. `RXS_ExiML` is unimodal and skewed right. `RXS_SRC_FLUX` is unimodal and fairly symmetric with outliers to the right. `Z_BEST` is unimodal, skewed left, and also contains outliers. A smaller selection of these variables will be taken to be plotted against each other with the response variable. The previously log-transformed variables will remained log-transformed for better visualization. In order to show only the quasars and galaxies as the response variables, the star class is removed from both the response and predictor variables.
+
+```{r}
+predictors.plt2 = dplyr::select(pred, ALLW_Hmag, ALLW_W2mag, ALLW_W3mag, ALLW_W4mag, RXS_CRate, RXS_LOGGALNH, SDSS_FIBER2MAG_r, Z_BEST) 
+predictors.plt2 = predictors.plt2 %>% mutate(RXS_CRate=log10(RXS_CRate), Z_BEST=log10(Z_BEST))
+ggpairs(predictors.plt2, mapping=aes(color=resp, alpha=0.3), progress = FALSE)
+```
+
+`ALLW_Hmag` vs `ALLW_W2mag`, `ALLW_W2mag` vs `ALLW_W3mag`, `ALLW_W2mag` vs `ALLW_W4mag`, and `ALLW_W3mag` vs `ALLW_W4mag` appear highly correalted. The graphs including `RXS_CRate` are pretty flat against the axis that is not `RXS_CRate`. The remaining graphs have little correalation between the variables.
+
+\n
+
+\n Principal component analysis will be used to see if a subset of the original predictors are the main conrtibutors to the important principal components.
+
+
+```{r}
+pr.out = prcomp(predictors, scale=TRUE)
+pr.var = pr.out$sdev ^2
+pve = pr.var/sum(pr.var)
+ggplot(data.frame(pve=pve, num=1:26), mapping = aes(x=num, y=cumsum(pve))) + geom_line() + geom_point() + labs(x='Principal Component', y='Cum. Prop. of Variance Explained') + geom_hline(yintercept=0.95, color='red')
+round(pr.out$rotation[,1:8],3)
+```
+
+In order to retain 95% of the data varability, 8 principal components were retained. PC1 and PC2 are not very strongly correlated to any variable. PC3 is strongly tied to `RXS_ExiML`, `RXS_CRate`, and `RXS_SRC_FLUX`. PC4 is tied to `ALLW_W3mag` and `ALLW_W4mag`. PC5 and PC6 is strongly tied to `RXS_Ext` and `RXS_LOGGALNH`. PC7 is tied to `SDSS_MODELMAG_u` and `Z_BEST`. PC8 is strongly tied to `Z_BEST`.
+
+## Analyses
+
+```{r echo=FALSE}
+# Forward Stepwise Selection
+log_forward = function(pred.train)
+{
+  var.num = ncol(pred.train)
+  var.keep = aic.keep = c()
+  var.rem = 1:var.num
+
+  var = 0
+  while ( var < var.num ) {
+    var = var+1
+    aic.tmp = rep(0,length(var.rem))
+    for ( ii in 1:length(var.rem) ) {
+      var.set = c(var.keep,var.rem[ii])
+      df = pred.train[,var.set]
+      if ( var == 1 ) df = data.frame(df)
+      aic.tmp[ii] = summary(suppressMessages(glm(resp.train~.,data=df,family=binomial)))$aic
+    }
+    aic.keep = append(aic.keep,min(aic.tmp))
+    w = which.min(aic.tmp)
+    var.keep = append(var.keep,var.rem[w])
+    var.rem = var.rem[-w]
+  }
+  # can plot aic.keep versus 1:var.num 
+  w = which.min(aic.keep)
+  var.keep = var.keep[1:w]
+  sort(names(pred.train[var.keep])) # alphabetical order <--- the set to keep
+  names(pred.train[-var.keep])      # the set to eliminate
+
+  return(sort(names(pred.train[var.keep])))
+}
+
+# Backward Stepwise Selection
+log_backward = function(pred.train)
+{
+  var.num = ncol(pred.train)
+  var.keep = 1:var.num
+  var.rem = aic.rem = c()
+
+  var = var.num
+  while ( var > 1 ) {
+    aic.tmp = rep(0,length(var.keep)-1)
+    for ( ii in 1:(length(var.keep)-1) ) {
+      var.set = var.keep[-ii]
+      df = pred.train[,var.set]
+      if ( var == 2 ) df = data.frame(df)
+      aic.tmp[ii] = summary(suppressMessages(glm(resp.train~.,data=df,family=binomial)))$aic
+    }
+    aic.rem = append(aic.rem,min(aic.tmp))
+    w = which.min(aic.tmp)
+    var.rem = append(var.rem,var.keep[w])
+    var.keep = var.keep[-w]
+    var = var-1
+  }
+  # can plot aic.rem versus 1:var.num 
+  w = which.min(aic.rem)
+  var.rem = var.rem[1:w]
+  names(pred.train[var.rem])        # the set to eliminate
+  sort(names(pred.train[-var.rem])) # alphabetical order <--- the set to keep
+
+  return(sort(names(pred.train[-var.rem])))
+}
+```
+
+### Splitting Data
+
+This data will be split into training and testing data. The training data will contain 70% of the data (2768 bodies), and the testing data will contain the remaining 30% of the data (1187 bodies).
+
+```{r}
+set.seed(101)
+
+indices = sample(length(resp), floor(0.7*length(resp)))
+predlog = pred %>% mutate(RXS_CRate = log10(RXS_CRate), Z_BEST = log10(Z_BEST), RXS_ExiML = log10(RXS_ExiML), RXS_SRC_FLUX=log10(RXS_SRC_FLUX))
+pred.train = pred %>% dplyr::slice(indices)
+pred.test = pred %>% dplyr::slice(-indices)
+predlog.train = predlog %>% dplyr::slice(indices)
+predlog.test = predlog %>% dplyr::slice(-indices)
+resp.train = resp[indices]
+resp.test = resp[-indices]
+```
+
+### Logistic Regression with Full Dataset
+
+Forward and backward stepwise selection is used as way to address multicollinearity in the data. Lasso and ridge regression, two types of penalized regression, may also address multicollinearity.
+
+```{r}
+#Logistic Regression
+log.out = glm(resp.train~., pred.train, family=binomial)
+log.prob = predict(log.out, pred.test, type='response')
+roc.log = roc(resp.test, log.prob)
+auc.log = round(roc.log$auc,4)
+auc.log 
+
+#Forward/Backward Stepwise Selection
+forward.out = log_forward(pred.train=pred.train)
+backward.out = log_backward(pred.train = pred.train)
+
+df.fss = pred.train %>% dplyr::select(forward.out)
+df.bss = pred.train %>% dplyr::select(backward.out)
+
+log.fss.out = glm(resp.train~., df.fss, family=binomial)
+log.fss.prob = predict(log.fss.out, newdata=pred.test, type="response")
+roc.log.fss = roc(resp.test, log.fss.prob)
+auc.log.fss = round(roc.log.fss$auc,4)
+J.logfss=max(roc.log.fss$sensitivities + roc.log.fss$specificities -1)
+logfss.pred = factor(ifelse(log.fss.prob>J.logfss, "QSO", "GALAXY"))
+tab.logfss = table(logfss.pred, resp.test)
+MCR.logfss = sum(ifelse(logfss.pred!=resp.test, 1, 0)) / length(resp.test)
+auc.log.fss
+
+log.bss.out = glm(resp.train~., df.bss, family=binomial)
+log.bss.prob = predict(log.bss.out, newdata=pred.test, type="response")
+roc.log.bss = roc(resp.test, log.bss.prob)
+auc.log.bss = round(roc.log.bss$auc,4)
+auc.log.bss
+
+#Ridge regression
+x = model.matrix(resp.train~., pred.train)
+ridge.out = glmnet(x, resp.train, alpha=0, family='binomial')
+
+set.seed(101)
+cv.ridge.out = cv.glmnet(x, resp.train, alpha=0, family='binomial')
+ridge.bestlam=cv.ridge.out$lambda.min
+
+x.test = model.matrix(resp.test~., pred.test)
+ridge.prob = predict(ridge.out, s=ridge.bestlam, newx=x.test)
+roc.ridge = roc(resp.test, ridge.prob)
+auc.ridge = round(roc.ridge$auc,4)
+auc.ridge
+
+#Lasso Regression
+y = model.matrix(resp.train~., pred.train)
+lasso.out = glmnet(y, resp.train, alpha=1, family='binomial')
+
+set.seed(101)
+cv.lasso.out = cv.glmnet(y, resp.train, alpha=1, family='binomial')
+lasso.bestlam=cv.lasso.out$lambda.min
+
+y.test = model.matrix(resp.test~., pred.test)
+lasso.prob = predict(lasso.out, s=lasso.bestlam, newx=y.test)
+roc.lasso = roc(resp.test, lasso.prob)
+auc.lasso = round(roc.lasso$auc,4)
+auc.lasso
+```
+
+### Logistic Regression with Reduced Dataset
+
+The variance inflation factor (VIF) is also used to address the multicollinearity of the data.
+
+```{r}
+library(car)
+THRESHOLD = 10
+pred.vif = pred.train
+istop = 0
+while ( istop == 0 ) {
+  log.out = glm(resp.train~.,data=pred.vif,family=binomial)
+  v = vif(log.out)
+  if ( max(v) > THRESHOLD ) {
+    pred.vif = pred.vif[,-which.max(v)]
+  } else {
+    istop = 1
+  }
+}
+print(v)
+
+log.vif.out = glm(resp.train~., pred.vif, family=binomial) ##DF1 IS WHAT WOULD CHANGE
+log.vif.prob = predict(log.vif.out, newdata=pred.test, type="response")
+roc.log.vif = roc(resp.test, log.vif.prob)
+auc.log.vif = round(roc.log.vif$auc,4)
+auc.log.vif
+
+#Forward/Backward Stepwise Selection
+pred.fssvif = df.fss
+istop = 0
+while ( istop == 0 ) {
+  log.out = glm(resp.train~.,data=pred.fssvif,family=binomial)
+  v = vif(log.out)
+  if ( max(v) > THRESHOLD ) {
+    pred.fssvif = pred.fssvif[,-which.max(v)]
+  } else {
+    istop = 1
+  }
+}
+print(v)
+log.viffss.out = glm(resp.train~., pred.fssvif, family=binomial)
+log.viffss.prob = predict(log.viffss.out, newdata=pred.test, type="response")
+roc.log.viffss = roc(resp.test, log.viffss.prob)
+auc.log.viffss = round(roc.log.viffss$auc,4)
+auc.log.viffss
+
+pred.bssvif = df.bss
+istop = 0
+while ( istop == 0 ) {
+  log.out = glm(resp.train~.,data=pred.bssvif,family=binomial)
+  v = vif(log.out)
+  if ( max(v) > THRESHOLD ) {
+    pred.bssvif = pred.bssvif[,-which.max(v)]
+  } else {
+    istop = 1
+  }
+}
+print(v)
+log.vifbss.out = glm(resp.train~., pred.bssvif, family=binomial)
+log.vifbss.prob = predict(log.vifbss.out, newdata=pred.test, type="response")
+roc.log.vifbss = roc(resp.test, log.vifbss.prob)
+auc.log.vifbss = round(roc.log.vifbss$auc,4)
+auc.log.vifbss
+
+#Ridge regression
+xvif = model.matrix(resp.train~., pred.vif)
+ridgevif.out = glmnet(xvif, resp.train, alpha=0, family='binomial')
+
+cv.ridgevif.out = cv.glmnet(xvif, resp.train, alpha=0, family='binomial')
+ridgevif.bestlam=cv.ridgevif.out$lambda.min
+
+pred.test.vif = pred.test %>% dplyr::select(RXS_ExiML, RXS_Ext, RXS_LOGGALNH, ALLW_W2mag, ALLW_W4mag, ALLW_Hmag, SDSS_MODELMAG_i, SDSS_FIBER2MAG_u, Z_BEST, GAIA_DR2_phot_g_mean_mag)
+x.test.vif = model.matrix(resp.test~., pred.test.vif)
+ridgevif.prob = predict(ridgevif.out, s=ridgevif.bestlam, newx=x.test.vif)
+roc.ridgevif = roc(resp.test, ridgevif.prob)
+auc.ridgevif = round(roc.ridgevif$auc,4)
+auc.ridgevif
+
+#Lasso regression
+lassovif.out = glmnet(xvif, resp.train, alpha=1, family='binomial')
+
+cv.lassovif.out = cv.glmnet(xvif, resp.train, alpha=1, family='binomial')
+lassovif.bestlam=cv.lassovif.out$lambda.min
+lassovif.prob = predict(lassovif.out, s=lassovif.bestlam, newx=x.test.vif)
+roc.lassovif = roc(resp.test, lassovif.prob)
+auc.lassovif = round(roc.lassovif$auc,4)
+auc.lassovif
+```
+
+### Linear Discriminant Analysis
+
+For linear discriminant analysis, `RXS_SRC_FLUX` was logged-transformed in order to differentiate the values more and complete the analysis.
+
+```{r}
+lda.pred.train = pred.train %>% mutate(RXS_SRC_FLUX=log(RXS_SRC_FLUX, 10))
+lda.out = lda(resp.train~., data=lda.pred.train)
+lda.predict= predict(lda.out, pred.test, type='prob')
+lda.prob = lda.predict$posterior[,2] 
+roc.lda = roc(resp.test, lda.prob)
+auc.lda = round(roc.lda$auc,4)
+auc.lda
+#tab.lda = table(lda.predict$class, resp.test)
+#MCR.lda = sum(ifelse(lda.predict$class!=resp.test, 1, 0)) / length(resp.test)
+```
+
+### Forest 
+
+```{r}
+library(rpart)
+library(rpart.plot)
+tree.out = rpart(resp.train~., pred.train)
+rpart.plot(tree.out)
+printcp(tree.out)
+plotcp(tree.out)
+tree.out = prune.rpart(tree.out, cp=0.022039)
+printcp(tree.out)
+plotcp(tree.out)
+tree.prob = predict(tree.out, newdata=pred.test, type='prob')
+roc.tree = roc(resp.test, tree.prob[,2])
+auc.tree = round(roc.tree$auc,4)
+auc.tree
+# tree.pred = factor(ifelse(tree.prob[,2]>0.5, "QSO", "GALAXY"))
+# tab.tree = table(tree.pred, resp.test)
+# MCR.tree = sum(ifelse(tree.pred!=resp.test, 1, 0)) / length(resp.test)
+```
+
+### Random Forest
+
+```{r}
+library(randomForest)
+set.seed(101)
+rf.out = randomForest(factor(resp.train)~., pred.train, importance=TRUE)
+rf.prob = predict(rf.out, pred.test, type='prob')
+roc.rf = roc(resp.test, rf.prob[,2])
+auc.rf = round(roc.rf$auc,4)
+auc.rf
+varImpPlot(rf.out, type=1)
+# rf.pred = factor(ifelse(rf.prob[,2]>0.5, "QSO", "GALAXY"))
+# tab.rf = table(rf.pred, resp.test)
+# MCR.rf = sum(ifelse(rf.pred!=resp.test, 1, 0)) / length(resp.test)
+```
+
+### Boosting
+
+```{r}
+library(xgboost)
+resp.train.b = ifelse(resp.train=='GALAXY', 0, 1)
+resp.test.b = ifelse(resp.test=='GALAXY', 0, 1)
+train = xgb.DMatrix(data=as.matrix(pred.train), label=resp.train.b)
+test = xgb.DMatrix(data=as.matrix(pred.test), label=resp.test.b)
+xgb.out = xgb.cv(train, nfold=20, nrounds=20, params=list(objective="binary:logistic"), verbose=0)
+opt = which.min(xgb.out$evaluation_log$test_error_mean)
+boost.out = xgboost(train, nrounds = opt, params=list(objective="binary:logistic"), verbose=0)
+boost.prob = predict(boost.out, test)
+roc.boost = roc(resp.test, boost.prob)
+auc.boost = round(roc.boost$auc,4)
+auc.boost
+importance.class = xgb.importance(model=boost.out)
+xgb.plot.importance(importance.class)
+# boost.pred = factor(ifelse(boost.prob>0.5, "QSO", "GALAXY"))
+# tab.boost = table(boost.pred, resp.test)
+# MCR.boost = sum(ifelse(boost.pred!=resp.test, 1, 0)) / length(resp.test)
+```
+
+### kNN
+
+```{r}
+library(FNN)
+k.max = 15
+mcr.k = rep(NA, k.max)
+for (ii in 1:k.max) {
+  knn.out.temp = knn.cv(pred.train, cl=resp.train, k=ii, algorithm="kd_tree")
+  mcr.k[ii] = sum(ifelse(knn.out.temp!=resp.train, 1, 0)) / length(resp.train)
+}
+k.min = which.min(mcr.k)
+k.min
+knn.out = knn(pred.train, pred.test, cl=resp.train, k=k.min, algorithm = 'kd_tree', prob=TRUE)
+knn.prob = attr(knn.out, 'prob')
+roc.knn = roc(resp.test, knn.prob)
+auc.knn = round(roc.knn$auc,4)
+auc.knn
+```
+
+
+### Naive Bayes
+
+```{r}
+library(naivebayes)
+nb.out = naive_bayes(pred.train, resp.train)
+nb.prob = predict(nb.out, pred.test, type='prob')[,2]
+roc.nb = roc(resp.test, nb.prob)
+auc.nb = round(roc.nb$auc,4)
+auc.nb
+# nb.pred = factor(ifelse(nb.prob>0.5, "QSO", "GALAXY"))
+# tab.nb = table(nb.pred, resp.test)
+# MCR.nb = sum(ifelse(nb.pred!=resp.test, 1, 0)) / length(resp.test)
+```
+
+### SVM
+
+```{r}
+library(e1071)
+set.seed(101)
+
+predicto = rbind(pred.train, pred.test)
+predicto = scale(predicto)
+len = nrow(pred.train)
+pred.train.s = predicto[1:len,]
+pred.test.s = predicto[-(1:len),]
+
+#linear 
+tune.out.lin = tune(svm, train.x = pred.train.s, train.y = resp.train, kernel='linear', ranges=list(cost=c(0.1, 1, 10, 100, 0.01)), probability = TRUE)
+svm.pred.lin = predict(tune.out.lin$best.model, newdata = pred.test.s, probability = TRUE)
+svm.prob.lin = attr(svm.pred.lin, 'probabilities')
+roc.svmlin = roc(resp.test, svm.prob.lin[,2])
+auc.svmlin = round(roc.svmlin$auc,4)
+auc.svmlin
+# MCR.svm.lin = (sum(ifelse(resp.test != svm.pred.lin, 1, 0))/length(resp.test))
+# tab.svm.lin = table(svm.pred.lin, resp.test)
+
+#polynomial
+tune.out.poly = tune(svm, train.x = pred.train.s, train.y = resp.train, kernel='polynomial', ranges=list(degree=2:10, cost=c(0.1, 1, 10, 100, 0.01)), probability = TRUE)
+svm.pred.poly = predict(tune.out.poly$best.model, newdata = pred.test.s, probability = TRUE)
+svm.prob.poly = attr(svm.pred.poly, 'probabilities')
+roc.svmpoly = roc(resp.test, svm.prob.poly[,2])
+auc.svmpoly = round(roc.svmpoly$auc,4)
+auc.svmpoly
+# MCR.svm.poly = (sum(ifelse(resp.test != svm.pred.poly, 1, 0))/length(resp.test))
+# tab.svm.poly = table(svm.pred.poly, resp.test)
+
+#radial
+tune.out.rad = tune(svm, train.x = pred.train.s, train.y = resp.train, kernel='radial', ranges=list(gamma=1:10, cost=c(0.1, 1, 10, 100, 0.01)), probability = TRUE)
+svm.pred.rad = predict(tune.out.rad$best.model, newdata = pred.test.s, probability = TRUE)
+svm.prob.rad = attr(svm.pred.rad, 'probabilities')
+roc.svmrad = roc(resp.test, svm.prob.rad[,2])
+auc.svmrad = round(roc.svmrad$auc,4)
+auc.svmrad
+# MCR.svm.rad = (sum(ifelse(resp.test != svm.pred.rad, 1, 0))/length(resp.test))
+# tab.svm.rad = table(svm.pred.rad, resp.test)
+```
+
+### Log-Transformed Data
+
+The previous models will be fitted with the log-transformed data. Their AUCs will be reported below.
+
+```{r include=FALSE}
+#Logistic Regression
+loglog.out = glm(resp.train~., predlog.train, family=binomial)
+loglog.prob = predict(loglog.out, predlog.test, type='response')
+roc.loglog = roc(resp.test, loglog.prob)
+auc.loglog = round(roc.loglog$auc,4)
+auc.loglog 
+
+#Forward/Backward Stepwise Selection
+forwardlog.out = log_forward(pred.train=predlog.train)
+backwardlog.out = log_backward(pred.train = predlog.train)
+
+df.fsslog= predlog.train %>% dplyr::select(forwardlog.out)
+df.bsslog = predlog.train %>% dplyr::select(backwardlog.out)
+
+loglog.fss.out = glm(resp.train~., df.fsslog, family=binomial)
+loglog.fss.prob = predict(loglog.fss.out, newdata=predlog.test, type="response")
+roc.loglog.fss = roc(resp.test, loglog.fss.prob)
+auc.loglog.fss = round(roc.loglog.fss$auc,4)
+auc.loglog.fss
+
+loglog.bss.out = glm(resp.train~., df.bsslog, family=binomial)
+loglog.bss.prob = predict(loglog.bss.out, newdata=predlog.test, type="response")
+roc.loglog.bss = roc(resp.test, loglog.bss.prob)
+auc.loglog.bss = round(roc.loglog.bss$auc,4)
+auc.loglog.bss
+
+#Ridge regression
+xlog = model.matrix(resp.train~., predlog.train)
+ridgelog.out = glmnet(xlog, resp.train, alpha=0, family='binomial')
+
+set.seed(101)
+cv.ridgelog.out = cv.glmnet(xlog, resp.train, alpha=0, family='binomial')
+ridgelog.bestlam=cv.ridgelog.out$lambda.min
+
+xlog.test = model.matrix(resp.test~., predlog.test)
+ridgelog.prob = predict(ridgelog.out, s=ridgelog.bestlam, newx=xlog.test)
+roc.ridgelog = roc(resp.test, ridgelog.prob)
+auc.ridgelog = round(roc.ridgelog$auc,4)
+auc.ridgelog
+
+#Lasso Regression
+ylog = model.matrix(resp.train~., predlog.train)
+lassolog.out = glmnet(ylog, resp.train, alpha=1, family='binomial')
+
+set.seed(101)
+cv.lassolog.out = cv.glmnet(ylog, resp.train, alpha=1, family='binomial')
+lassolog.bestlam=cv.lassolog.out$lambda.min
+
+ylog.test = model.matrix(resp.test~., predlog.test)
+lassolog.prob = predict(lassolog.out, s=lassolog.bestlam, newx=ylog.test)
+roc.lassolog = roc(resp.test, lassolog.prob)
+auc.lassolog = round(roc.lassolog$auc,4)
+auc.lassolog
+
+library(car)
+THRESHOLD = 10
+predlog.vif = predlog.train
+istop = 0
+while ( istop == 0 ) {
+  log.out = glm(resp.train~.,data=predlog.vif,family=binomial)
+  v = vif(log.out)
+  if ( max(v) > THRESHOLD ) {
+    predlog.vif = predlog.vif[,-which.max(v)]
+  } else {
+    istop = 1
+  }
+}
+print(v)
+
+loglog.vif.out = glm(resp.train~., predlog.vif, family=binomial) 
+loglog.vif.prob = predict(loglog.vif.out, newdata=predlog.test, type="response")
+roc.loglog.vif = roc(resp.test, loglog.vif.prob)
+auc.loglog.vif = round(roc.loglog.vif$auc,4)
+auc.loglog.vif
+
+#Forward/Backward Stepwise Selection
+predlog.fssvif = df.fsslog
+istop = 0
+while ( istop == 0 ) {
+  log.out = glm(resp.train~.,data=predlog.fssvif,family=binomial)
+  v = vif(log.out)
+  if ( max(v) > THRESHOLD ) {
+    predlog.fssvif = predlog.fssvif[,-which.max(v)]
+  } else {
+    istop = 1
+  }
+}
+print(v)
+loglog.viffss.out = glm(resp.train~., predlog.fssvif, family=binomial)
+loglog.viffss.prob = predict(loglog.viffss.out, newdata=predlog.test, type="response")
+roc.loglog.viffss = roc(resp.test, loglog.viffss.prob)
+auc.loglog.viffss = round(roc.loglog.viffss$auc,4)
+auc.loglog.viffss
+
+predlog.bssvif = df.bsslog
+istop = 0
+while ( istop == 0 ) {
+  log.out = glm(resp.train~.,data=predlog.bssvif,family=binomial)
+  v = vif(log.out)
+  if ( max(v) > THRESHOLD ) {
+    predlog.bssvif = predlog.bssvif[,-which.max(v)]
+  } else {
+    istop = 1
+  }
+}
+print(v)
+loglog.vifbss.out = glm(resp.train~., predlog.bssvif, family=binomial)
+loglog.vifbss.prob = predict(loglog.vifbss.out, newdata=predlog.test, type="response")
+roc.loglog.vifbss = roc(resp.test, loglog.vifbss.prob)
+auc.loglog.vifbss = round(roc.loglog.vifbss$auc,4)
+auc.loglog.vifbss
+
+#Ridge regression
+xviflog = model.matrix(resp.train~., predlog.vif)
+ridgeviflog.out = glmnet(xviflog, resp.train, alpha=0, family='binomial')
+
+cv.ridgeviflog.out = cv.glmnet(xviflog, resp.train, alpha=0, family='binomial')
+ridgeviflog.bestlam=cv.ridgeviflog.out$lambda.min
+
+pred.test.viflog = predlog.test %>% dplyr::select(RXS_ExiML, RXS_CRate, RXS_Ext, RXS_LOGGALNH, ALLW_W2mag, ALLW_W3mag, ALLW_W4mag, ALLW_Kmag, SDSS_MODELMAG_i, SDSS_FIBER2MAG_u, Z_BEST, GAIA_DR2_phot_g_mean_mag)
+x.test.viflog = model.matrix(resp.test~., pred.test.viflog)
+ridgeviflog.prob = predict(ridgeviflog.out, s=ridgeviflog.bestlam, newx=x.test.viflog)
+roc.ridgeviflog = roc(resp.test, ridgeviflog.prob)
+auc.ridgeviflog = round(roc.ridgeviflog$auc,4)
+auc.ridgeviflog
+
+#Lasso regression
+lassoviflog.out = glmnet(xviflog, resp.train, alpha=1, family='binomial')
+
+cv.lassoviflog.out = cv.glmnet(xviflog, resp.train, alpha=1, family='binomial')
+lassoviflog.bestlam=cv.lassoviflog.out$lambda.min
+lassoviflog.prob = predict(lassoviflog.out, s=lassoviflog.bestlam, newx=x.test.viflog)
+roc.lassoviflog = roc(resp.test, lassoviflog.prob)
+auc.lassoviflog = round(roc.lassoviflog$auc,4)
+auc.lassoviflog
+
+#LDA
+ldalog.out = lda(resp.train~., data=predlog.train)
+ldalog.predict= predict(ldalog.out, predlog.test, type='prob')
+ldalog.prob = ldalog.predict$posterior[,2] 
+roc.ldalog = roc(resp.test, ldalog.prob)
+auc.ldalog = round(roc.ldalog$auc,4)
+auc.ldalog
+
+#tree
+library(rpart)
+library(rpart.plot)
+treelog.out = rpart(resp.train~., predlog.train)
+rpart.plot(treelog.out)
+printcp(treelog.out)
+plotcp(treelog.out)
+treelog.out = prune.rpart(treelog.out, cp=0.022039)
+printcp(treelog.out)
+plotcp(treelog.out)
+treelog.prob = predict(treelog.out, newdata=predlog.test, type='prob')
+roc.treelog = roc(resp.test, treelog.prob[,2])
+auc.treelog = round(roc.treelog$auc,4)
+auc.treelog
+
+#rf
+library(randomForest)
+rflog.out = randomForest(factor(resp.train)~., predlog.train, importance=TRUE)
+rflog.prob = predict(rflog.out, predlog.test, type='prob')
+roc.rflog = roc(resp.test, rflog.prob[,2])
+auc.rflog = round(roc.rflog$auc,4)
+auc.rflog
+varImpPlot(rflog.out, type=1)
+
+#boosting
+library(xgboost)
+resp.train.blog = ifelse(resp.train=='GALAXY', 0, 1)
+resp.test.blog = ifelse(resp.test=='GALAXY', 0, 1)
+trainlog = xgb.DMatrix(data=as.matrix(predlog.train), label=resp.train.blog)
+testlog = xgb.DMatrix(data=as.matrix(predlog.test), label=resp.test.blog)
+xgblog.out = xgb.cv(trainlog, nfold=20, nrounds=20, params=list(objective="binary:logistic"), verbose=0)
+opt = which.min(xgblog.out$evaluation_log$test_error_mean)
+boostlog.out = xgboost(trainlog, nrounds = opt, params=list(objective="binary:logistic"), verbose=0)
+boostlog.prob = predict(boostlog.out, testlog)
+roc.boostlog = roc(resp.test, boostlog.prob)
+auc.boostlog = round(roc.boostlog$auc,4)
+auc.boostlog
+importancelog.class = xgb.importance(model=boostlog.out)
+xgb.plot.importance(importancelog.class)
+
+#knn
+library(FNN)
+k.max = 15
+mcr.k = rep(NA, k.max)
+for (ii in 1:k.max) {
+  knn.out.temp = knn.cv(predlog.train, cl=resp.train, k=ii, algorithm="kd_tree")
+  mcr.k[ii] = sum(ifelse(knn.out.temp!=resp.train, 1, 0)) / length(resp.train)
+}
+k.min = which.min(mcr.k)
+k.min
+knnlog.out = knn(predlog.train, predlog.test, cl=resp.train, k=k.min, algorithm = 'kd_tree', prob=TRUE)
+knnlog.prob = attr(knnlog.out, 'prob')
+roc.knnlog = roc(resp.test, knnlog.prob)
+auc.knnlog = round(roc.knnlog$auc,4)
+auc.knnlog
+
+#naive bayes
+library(naivebayes)
+nblog.out = naive_bayes(predlog.train, resp.train)
+nblog.prob = predict(nblog.out, predlog.test, type='prob')[,2]
+roc.nblog = roc(resp.test, nblog.prob)
+auc.nblog = round(roc.nblog$auc,4)
+auc.nblog
+
+#SVM
+library(e1071)
+
+predictolog = rbind(predlog.train, pred.test)
+predictolog = scale(predictolog)
+len = nrow(predlog.train)
+predlog.train.s = predictolog[1:len,]
+predlog.test.s = predictolog[-(1:len),]
+
+#linear 
+tune.out.lin = tune(svm, train.x = predlog.train.s, train.y = resp.train, kernel='linear', ranges=list(cost=c(0.1, 1, 10, 100, 0.01)), probability = TRUE)
+svm.pred.lin = predict(tune.out.lin$best.model, newdata = predlog.test.s, probability = TRUE)
+svm.prob.lin = attr(svm.pred.lin, 'probabilities')
+roc.svmlinlog = roc(resp.test, svm.prob.lin[,2])
+auc.svmlinlog = round(roc.svmlinlog$auc,4)
+auc.svmlinlog
+# MCR.svm.lin = (sum(ifelse(resp.test != svm.pred.lin, 1, 0))/length(resp.test))
+# tab.svm.lin = table(svm.pred.lin, resp.test)
+
+#polynomial
+tune.out.poly = tune(svm, train.x = predlog.train.s, train.y = resp.train, kernel='polynomial', ranges=list(degree=2:10, cost=c(0.1, 1, 10, 100, 0.01)), probability = TRUE)
+svm.pred.poly = predict(tune.out.poly$best.model, newdata = predlog.test.s, probability = TRUE)
+svm.prob.poly = attr(svm.pred.poly, 'probabilities')
+roc.svmpolylog = roc(resp.test, svm.prob.poly[,2])
+auc.svmpolylog = round(roc.svmpolylog$auc,4)
+auc.svmpolylog
+# MCR.svm.poly = (sum(ifelse(resp.test != svm.pred.poly, 1, 0))/length(resp.test))
+# tab.svm.poly = table(svm.pred.poly, resp.test)
+
+#radial
+tune.out.rad = tune(svm, train.x = predlog.train.s, train.y = resp.train, kernel='radial', ranges=list(gamma=1:10, cost=c(0.1, 1, 10, 100, 0.01)), probability = TRUE)
+svm.pred.rad = predict(tune.out.rad$best.model, newdata = predlog.test.s, probability = TRUE)
+svm.prob.rad = attr(svm.pred.rad, 'probabilities')
+roc.svmradlog = roc(resp.test, svm.prob.rad[,2])
+auc.svmradlog = round(roc.svmradlog$auc,4)
+auc.svmradlog
+```
+
+### Results
+
+For the regression models, variance inflation factor (VIF) and forward/backward stepwise selection were used to address multicollinearity in the data. For the other models, multicollinearity does not matter as much; however, some models do have some form of variable selection or reveal some variables to be more important than others. For the models that give the importance of variables, the top five most important are listed. A comparison of the selected variables is presented below. We see that `ALLW_W2mag`, `ALLW_W4mag`, `SDSS_FIBER2AMG_u`, and `Z_BEST` appear in at least six of the eight models examined for both datasets. `ALLW_W3mag` is the sole vairable used in the tree model for both datasets.
+
+```{r echo=FALSE}
+method = c('Forward Stepwise Selection', 'Backward Stepwise Selection', 'VIF', 'VIF with Forward Stepwise Selection', 'VIF with Backward Stepwise Selection', 'Tree', 'Random Forest', 'Boosting')
+variables = c(paste(forward.out, collapse = ', '), paste(backward.out, collapse = ', '), 'ALLW_Hmag, ALLW_W2mag, ALLW_W4mag, GAIA_DR2_phot_g_mean_mag, RXS_ExiML, RXS_Ext, RXS_LOGGALNH, SDSS_FIBER2MAG_u, SDSS_MODELMAG_z, Z_BEST', 'ALLW_W2mag, ALLW_W3mag, ALLW_W4mag, GAIA_DR2_phot_g_mean_mag, RXS_LOGGALNH, SDSS_FIBER2MAG_u, SDSS_MODELMAG_z, Z_BEST','ALLW_Kmag, ALLW_W2mag, ALLW_W4mag, GAIA_DR2_phot_g_mean_mag, RXS_LOGGALNH, SDSS_FIBER2MAG_u, SDSS_MODELMAG_z, Z_BEST', 'ALLW_W3mag', 'ALLW_W2mag, ALLW_W3mag, ALLW_W4mag, SDSS_FIBER2MAG_u, Z_BEST', 'ALLW_W2mag, ALLW_W3mag, RXS_SRC_FLUX, SDSS_FIBER2MAG_u, Z_BEST')
+logvariables = c(paste(forwardlog.out, collapse = ', '), paste(backwardlog.out, collapse = ', '), 'ALLW_Kmag, ALLW_W2mag, ALLW_W3mag, ALLW_W4mag, GAIA_DR2_phot_g_mean_mag, RXS_CRate, RXS_ExiML, RXS_Ext, RXS_LOGGALNH, SDSS_FIBER2MAG_u, SDSS_MODELMAG_i, Z_BEST', 'ALLW_Kmag, ALLW_W2mag, ALLW_W3mag, ALLW_W4mag, GAIA_DR2_phot_g_mean_mag, RXS_LOGGALNH, SDSS_FIBER2MAG_u, SDSS_MODELMAG_z, Z_BEST', 'ALLW_Kmag, ALLW_W2mag, ALLW_W3mag, ALLW_W4mag, GAIA_DR2_phot_g_mean_mag, RXS_CRate, RXS_SRC_FLUX, SDSS_MODELMAG_r, SDSS_MODELMAG_u, Z_BEST', 'ALLW_W3mag', 'ALLW_W2mag, ALLW_W3mag, ALLW_W4mag, SDSS_FIIBER2MAG_u, Z_BEST', 'ALLW_W2mag, ALLW_W3mag, RXS_SRC_FLUX, SDSS_FIBER2MAG_u, Z_BEST')
+
+kable(data.frame(method, variables, logvariables), col.names = c('Test', 'Retained Variables from Original Dataset', 'Retained Variables from Log-Transformed Dataset'))
+```
+
+\n 
+\n
+
+The area under the curve (AUC) indicates the prediction power of a model without having the class imbalance affect the metric. Because these data are not balanced, we use the area under the curve to determine the best model. We see that *logisitic regression with forward stepwise selection from the original dataset* has the greatest area under the curve. Additionally, regression models and models created from the original dataset tend to do better than others. Using a VIF-reduced model does not improve the area under the curve, but does improve the inference one has when using that model. If one only cares about prediction rather than multicollinearity, using VIF, forward/backward selection, or penalized regression is not important. 
+
+```{r echo=FALSE}
+tests = c('Logistic Regression', 'Logistic Regression with VIF', 'Logistic Regression with Forward Stepwise Selection', 'Logistic Regression with VIF and Backward Stepwise Selection', 'Linear Discriminant Analysis', 'Ridge Regression', 'Ridge Regression with VIF', 'Lasso Regression', 'Lasso Regression with VIF', 'Tree', 'Random Forest', 'Boosting', 'kNN', 'Naive Bayes', 'Linear SVM', 'Polynomial SVM', 'Radial SVM', 'Logistic Regression with Backward Stepwise Selection', 'Logistic Regression with VIF and Forward Stepwise Selection')
+auc = c(auc.log, auc.log.vif, auc.log.fss, auc.log.vifbss, auc.lda, auc.ridge, auc.ridgevif, auc.lasso, auc.lassovif, auc.tree, auc.rf, auc.boost, auc.knn, auc.nb, auc.svmlin, auc.svmpoly, auc.svmrad, auc.log.bss, auc.log.viffss)
+auclog = c(auc.loglog, auc.loglog.vif, auc.loglog.fss, auc.loglog.vifbss, auc.ldalog, auc.ridgelog, auc.ridgeviflog, auc.lassolog, auc.lassoviflog, auc.treelog, auc.rflog, auc.boostlog, auc.knnlog, auc.nblog, auc.svmlinlog, auc.svmpolylog, auc.svmradlog, auc.loglog.bss, auc.loglog.viffss)
+
+ordering = order(auc, decreasing = TRUE)
+auc = sort(auc, decreasing = TRUE)
+tests = tests[ordering]
+auclog = auclog[ordering]
+
+kable(data.frame(tests, auc, auclog), col.names = c('Test', 'AUC from Original Dataset', 'AUC from Log-Transformed Dataset'))
+```
+
+To supplement the discussion, here is more information regarding the best performing model: logistic regression with forward stepwise selection from the original dataset. Note that Youden's J statistic was used to determine where to classify the data, and it assumes that identifying each class is equally important.  
+
+```{r echo=FALSE}
+cat('Confusion Matrix for Logistic Regression with forward stepwise selection:', '\n')
+tab.logfss
+cat('Misclassification Rate for Logistic Regression with forward stepwise selection:', '\n')
+round(MCR.logfss,4)
+cat('Specificity for Logistic Regression with forward stepwise selection:', '\n')
+j.ind = which.max(roc.log.fss$sensitivities + roc.log.fss$specificities -1)
+round(roc.log.fss$specificities[j.ind],4)
+cat('Sensitivity for Logistic Regression with forward stepwise selection:', '\n')
+round(roc.log.fss$sensitivities[j.ind],4)
+```
+
+
+## Conclusions
+
+We were able to successfully classify astonomical objects as quasars or galaxies from brightness data using logistic regression with forward stepwise selection from the original dataset. The area under the curve is 0.9479, and the misclassification rate is 9.52%. 
